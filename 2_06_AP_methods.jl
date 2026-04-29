@@ -39,6 +39,9 @@ end
 # ╔═╡ a970174f-44f4-4f8f-8cb8-cdda7b7ff7f4
 using Theseus
 
+# ╔═╡ 61ff147f-8779-46e6-a93e-216573b22fe2
+using LinearAlgebra: norm
+
 # ╔═╡ e6c64c80-773b-11ef-2379-bf6609137e69
 md"""
 # 2.6 Asymptotic-preserving methods
@@ -74,7 +77,7 @@ end
 
 # ╔═╡ bba88681-65bb-484f-be26-5d7cba6919ce
 md"""
-Algorithmus: $(@bind alg Select([
+Method: $(@bind alg Select([
 	Theseus.SSP2222(),
 	Theseus.SSP2332(),
 	Theseus.ARS111(),
@@ -137,6 +140,162 @@ end
 
 # ╔═╡ dfc641db-0aeb-4c69-900e-82118f30ed62
 plot_kaps(alg, epsilon, u0, dt)
+
+# ╔═╡ 242e41ba-4589-4303-849d-a4a2c266ed69
+md"""
+## Order reduction
+
+Although IMEX methods can be AP, they may show order reduction for moderate values of $$\varepsilon$$. We use the test problem of
+
+- Pareschi and Russo (2000)
+  Implicit-explicit Runge-Kutta schemes for stiff systems of differential equations.
+  <https://www.researchgate.net/profile/Lorenzo-Pareschi/publication/230865813_Implicit-Explicit_Runge-Kutta_schemes_for_stiff_systems_of_differential_equations/links/0046352a03ba3ee92a000000/Implicit-Explicit-Runge-Kutta-schemes-for-stiff-systems-of-differential-equations.pdf>
+
+and compute numerical rates of convergence for two successive time step refinements starting with $$\Delta t = 0.05$$.
+"""
+
+# ╔═╡ ce036e0a-4fc3-4dfc-a812-5c98effc87f5
+function rhs_stiff_pareschi_russo!(du, u, p, t)
+	u1, u2 = u
+	du[1] = 0
+	du[2] = (sin(u1) - u2) / p.epsilon
+	return nothing
+end
+
+# ╔═╡ d778ade0-c42d-468c-a673-ffed55c7887e
+function rhs_nonstiff_pareschi_russo!(du, u, p, t)
+	u1, u2 = u
+	du[1] = p.alpha * u2
+	du[2] = p.beta * u1
+	return nothing
+end
+
+# ╔═╡ 0ac7b532-f529-42ba-a251-b3ca92d1d5a6
+md"""
+Method: $(@bind alg_for_order Select([
+	Theseus.SSP2222(),
+	Theseus.SSP2332(),
+	Theseus.ARS111(),
+	Theseus.ARS222(),
+	Theseus.ARS443(),
+]))
+"""
+
+# ╔═╡ 6f63ae90-26a6-4e7c-9810-9b11e44ad192
+function plot_convergence_rates(alg)
+	u0_eq = [pi / 2, 1.0]
+	u0_no = [pi / 2, 0.5]
+	dt = 0.05
+	tspan = (0.0, 5.0)
+	epsilons = 10.0 .^ range(-6, 0, length = 25)
+
+	function solve_history(alg, epsilon, dt, tspan, u0)
+	    ode = SplitODEProblem{true}(rhs_stiff_pareschi_russo!,
+									rhs_nonstiff_pareschi_russo!,
+									copy(u0), tspan,
+									(; alpha = -1.0, beta = 1.0, epsilon))
+	    integrator = Theseus.init(ode, alg;
+	                              dt = dt,
+	                              newton_tol_abs = 1.0e-8,
+	                              newton_tol_rel = 1.0e-8,
+	                              newton_max_niter = 100)
+	
+	    times = Float64[first(tspan)]
+	    u_values = Float64[u0[1]]
+	    v_values = Float64[u0[2]]
+
+	    while !integrator.finalstep
+	        Theseus.step!(integrator)
+	        push!(times, integrator.t)
+	        push!(u_values, integrator.u[1])
+	        push!(v_values, integrator.u[2])
+	    end
+	
+	    return (; t = times, u = u_values, v = v_values)
+	end
+
+	restrict_to_coarse_grid(values, ratio) = values[1:ratio:length(values)]
+
+	function relative_l2_error(values, reference_values)
+	    difference_norm = norm(values .- reference_values)
+	    reference_norm = norm(reference_values)
+		if iszero(reference_norm)
+	    	return difference_norm
+		else
+			return difference_norm / reference_norm
+		end
+	end
+
+	function convergence_rate(error_h, error_h2)
+	    if !(isfinite(error_h) && isfinite(error_h2)) || error_h <= 0 || error_h2 <= 0
+	        return NaN
+	    end
+	    return log2(error_h / error_h2)
+	end
+
+	function component_errors(coarse_values, medium_values, fine_values)
+	    error_h = relative_l2_error(coarse_values,
+									restrict_to_coarse_grid(medium_values, 2))
+	    error_h2 = relative_l2_error(medium_values,
+									 restrict_to_coarse_grid(fine_values, 2))
+	    return error_h, error_h2
+	end
+
+	function estimate_rates(alg, epsilon, dt, tspan, u0)
+	    solution_h = solve_history(alg, epsilon, dt, tspan, u0)
+	    solution_h2 = solve_history(alg, epsilon, dt / 2, tspan, u0)
+	    solution_h4 = solve_history(alg, epsilon, dt / 4, tspan, u0)
+	
+	    error_u_h, error_u_h2 = component_errors(solution_h.u,
+												 solution_h2.u,
+												 solution_h4.u)
+	    error_v_h, error_v_h2 = component_errors(solution_h.v,
+												 solution_h2.v,
+												 solution_h4.v)
+	
+	    return (; rate_u = convergence_rate(error_u_h, error_u_h2),
+	            rate_v = convergence_rate(error_v_h, error_v_h2),
+	            error_u_h = error_u_h,
+	            error_u_h2 = error_u_h2,
+	            error_v_h = error_v_h,
+	            error_v_h2 = error_v_h2)
+	end
+
+	rates_eq = [similar(epsilons), similar(epsilons)]
+	rates_no = [similar(epsilons), similar(epsilons)]
+	
+	for (u0, rates) in [(u0_eq, rates_eq), (u0_no, rates_no)]
+		for i in eachindex(epsilons)
+			res = estimate_rates(alg, epsilons[i], dt, tspan, u0)
+			rates[1][i] = res.rate_u
+			rates[2][i] = res.rate_v
+		end
+	end
+
+	fig = Figure()
+	
+	ax1 = Axis(fig[1, 1]; xlabel = L"\varepsilon", ylabel = "Convergence Rate", 
+			   title = "Equilibrium initial data", xscale = log10)
+	lines!(ax1, epsilons, rates_eq[1]; label = L"$u$ component")
+	lines!(ax1, epsilons, rates_eq[2]; label = L"$v$ component")
+	axislegend(ax1; position = :lb)
+	
+	ax2 = Axis(fig[1, 2]; xlabel = L"\varepsilon", ylabel = "Convergence Rate",
+			   title = "Non-equilibrium initial data", xscale = log10)
+	lines!(ax2, epsilons, rates_no[1]; label = L"$u$ component")
+	lines!(ax2, epsilons, rates_no[2]; label = L"$v$ component")
+	# axislegend(ax2)
+
+	for ax in (ax1, ax2)
+		xlims!(ax, first(epsilons), last(epsilons))
+        ylims!(ax, -0.5, 4.1)
+	end
+
+	return fig
+end
+
+# ╔═╡ 609797f7-8ba9-45a1-b3df-7d0601237217
+plot_convergence_rates(alg_for_order)
 
 # ╔═╡ 4340e86a-e0fe-4cfe-9d1a-9bb686cbb2fd
 md"""
@@ -227,9 +386,17 @@ let
 	show_imex_tableaux_latex(a_ex, b_ex, c_ex, a_im, b_im, c_im)
 end
 
+# ╔═╡ aa4672bd-c465-4986-8d23-8110b65d5e9d
+let
+	(; a_ex, b_ex, c_ex, a_im, b_im, c_im) = Theseus.RKTableau(alg_for_order, Rational{Int})
+	show_imex_tableaux_latex(a_ex, b_ex, c_ex, a_im, b_im, c_im)
+end
+
 # ╔═╡ ecc3d2a4-3a9a-4f1a-a070-3da403ecc005
+# ╠═╡ disabled = true
+#=╠═╡
 function plot_convergence_rates(alg)
-	u0_eq = [pi / 2, 1]
+	u0_eq = [pi / 2, 1.0]
 	u0_no = [pi / 2, 0.5]
 	dt = 0.05
 	epsilons = 10.0 .^ range(-6, 0, length = 101)
@@ -237,13 +404,13 @@ function plot_convergence_rates(alg)
 	function stiff!(du, u, p, t)
 		u1, u2 = u
 		du[1] = 0
-		du[2] = u1 + (sin(u1) - u2) / p.epsilon
+		du[2] = (sin(u1) - u2) / p.epsilon
 		return nothing
 	end
 	function nonstiff!(du, u, p, t)
 		u1, u2 = u
 		du[1] = -u2
-		du[2] = 0
+		du[2] = u1
 		return nothing
 	end
 
@@ -330,8 +497,8 @@ function plot_convergence_rates(alg)
 	for (u0, rates) in [(u0_eq, rates_eq), (u0_no, rates_no)]
 		for i in eachindex(epsilons)
 			err1a, err2a, err1b, err2b = compute_errors(alg, u0, epsilons[i], dt)
-			rates[1][i] = log(err1a / err1b) / log(2)
-			rates[2][i] = log(err2a / err2b) / log(2)
+			rates[1][i] = log2(err1a / err1b)
+			rates[2][i] = log2(err2a / err2b)
 		end
 	end
 
@@ -341,7 +508,7 @@ function plot_convergence_rates(alg)
 			   title = "Equilibrium initial data", xscale = log10)
 	lines!(ax1, epsilons, rates_eq[1]; label = L"$u$ component")
 	lines!(ax1, epsilons, rates_eq[2]; label = L"$v$ component")
-	axislegend(ax1)
+	axislegend(ax1; position = :lb)
 	
 	ax2 = Axis(fig[1, 2]; xlabel = L"\varepsilon", ylabel = "Convergence Rate",
 			   title = "Non-equilibrium initial data", xscale = log10)
@@ -349,22 +516,29 @@ function plot_convergence_rates(alg)
 	lines!(ax2, epsilons, rates_no[2]; label = L"$v$ component")
 	# axislegend(ax2)
 
+	for ax in (ax1, ax2)
+		xlims!(ax, first(epsilons), last(epsilons))
+        ylims!(ax, -0.5, 4.1)
+	end
+
 	return fig
 end
+  ╠═╡ =#
 
 # ╔═╡ 00000000-0000-0000-0000-000000000001
 PLUTO_PROJECT_TOML_CONTENTS = """
 [deps]
 CairoMakie = "13f3f980-e62b-5c42-98c6-ff1f3baf88f0"
 LaTeXStrings = "b964fa9f-0449-5b57-a5c2-d3ea65f4040f"
+LinearAlgebra = "37e2e46d-f89d-539d-b4ee-838fcccc9c8e"
 Markdown = "d6f4376e-aef5-505a-96c1-9c027394607a"
 PlutoUI = "7f904dfe-b85e-4ff6-b463-dae2292396a8"
 Theseus = "7f538e44-2768-4ef2-af90-2110c0378286"
 
 [compat]
-CairoMakie = "~0.15.9"
+CairoMakie = "~0.15.10"
 LaTeXStrings = "~1.4.0"
-PlutoUI = "~0.7.79"
+PlutoUI = "~0.7.80"
 Theseus = "~0.1.0"
 """
 
@@ -374,12 +548,12 @@ PLUTO_MANIFEST_TOML_CONTENTS = """
 
 julia_version = "1.10.11"
 manifest_format = "2.0"
-project_hash = "8cd8c79602025ee5de6b56a2d1ffa2869ac3db7c"
+project_hash = "0b1bf85a529a8c2139607850444fc2ab1d67c03b"
 
 [[deps.ADTypes]]
-git-tree-sha1 = "f7304359109c768cf32dc5fa2d371565bb63b68a"
+git-tree-sha1 = "bbc22a9a08a0ef6460041086d8a7b27940ed4ffd"
 uuid = "47edcb42-4c32-4615-8424-f2b9edc5f35b"
-version = "1.21.0"
+version = "1.22.0"
 weakdeps = ["ChainRulesCore", "ConstructionBase", "EnzymeCore"]
 
     [deps.ADTypes.extensions]
@@ -467,9 +641,9 @@ version = "1.1.1"
 
 [[deps.Ariadne]]
 deps = ["Enzyme", "Krylov", "LinearAlgebra", "SparseArrays"]
-git-tree-sha1 = "a8dafaabcabf764ebe4f0b2ab356deefd25e61a7"
+git-tree-sha1 = "5c180376563ae541091f0de4c5b607a46737d9d8"
 uuid = "0be81120-40bf-4f8b-adf0-26103efb66f1"
-version = "0.1.0"
+version = "0.1.2"
 
 [[deps.ArrayInterface]]
 deps = ["Adapt", "LinearAlgebra"]
@@ -584,9 +758,9 @@ version = "1.1.1"
 
 [[deps.CairoMakie]]
 deps = ["CRC32c", "Cairo", "Cairo_jll", "Colors", "FileIO", "FreeType", "GeometryBasics", "LinearAlgebra", "Makie", "PrecompileTools"]
-git-tree-sha1 = "fa072933899aae6dc61dde934febed8254e66c6a"
+git-tree-sha1 = "bf2d9cd1ec0c4ce3e0b5aaad192074969413f626"
 uuid = "13f3f980-e62b-5c42-98c6-ff1f3baf88f0"
-version = "0.15.9"
+version = "0.15.10"
 
 [[deps.Cairo_jll]]
 deps = ["Artifacts", "Bzip2_jll", "CompilerSupportLibraries_jll", "Fontconfig_jll", "FreeType2_jll", "Glib_jll", "JLLWrappers", "Libdl", "Pixman_jll", "Xorg_libXext_jll", "Xorg_libXrender_jll", "Zlib_jll", "libpng_jll"]
@@ -848,9 +1022,9 @@ uuid = "8ba89e20-285c-5b6f-9357-94700520ee1b"
 
 [[deps.Distributions]]
 deps = ["AliasTables", "FillArrays", "LinearAlgebra", "PDMats", "Printf", "QuadGK", "Random", "SpecialFunctions", "Statistics", "StatsAPI", "StatsBase", "StatsFuns"]
-git-tree-sha1 = "12184a8cf11c7cbd90a4db8b2cb2f7b6f057cc46"
+git-tree-sha1 = "e421c1938fafab0165b04dc1a9dbe2a26272952c"
 uuid = "31c24e10-a181-5473-b8eb-7969acd0382f"
-version = "0.25.124"
+version = "0.25.125"
 
     [deps.Distributions.extensions]
     DistributionsChainRulesCoreExt = "ChainRulesCore"
@@ -930,9 +1104,9 @@ version = "2.2.9"
 
 [[deps.Expat_jll]]
 deps = ["Artifacts", "JLLWrappers", "Libdl"]
-git-tree-sha1 = "27af30de8b5445644e8ffe3bcb0d72049c089cf1"
+git-tree-sha1 = "8f05e9a2e7c2e3eb524102bb2926c5743c07fbe1"
 uuid = "2e619515-83b5-522b-bb60-26c02a35a201"
-version = "2.7.3+0"
+version = "2.8.0+0"
 
 [[deps.ExprTools]]
 git-tree-sha1 = "27415f162e6028e81c72b82ef756bf321213b6ec"
@@ -951,9 +1125,9 @@ version = "0.1.6"
 
 [[deps.FFMPEG_jll]]
 deps = ["Artifacts", "Bzip2_jll", "FreeType2_jll", "FriBidi_jll", "JLLWrappers", "LAME_jll", "Libdl", "Ogg_jll", "OpenSSL_jll", "Opus_jll", "PCRE2_jll", "Zlib_jll", "libaom_jll", "libass_jll", "libfdk_aac_jll", "libva_jll", "libvorbis_jll", "x264_jll", "x265_jll"]
-git-tree-sha1 = "66381d7059b5f3f6162f28831854008040a4e905"
+git-tree-sha1 = "cac41ca6b2d399adfc95e51240566f8a60a80806"
 uuid = "b22a6f82-2f65-5046-a5b2-351ab43fb4e5"
-version = "8.0.1+1"
+version = "8.1.0+0"
 
 [[deps.FFTA]]
 deps = ["AbstractFFTs", "DocStringExtensions", "LinearAlgebra", "MuladdMacro", "Primes", "Random", "Reexport"]
@@ -963,9 +1137,9 @@ version = "0.3.1"
 
 [[deps.FastBroadcast]]
 deps = ["ArrayInterface", "LinearAlgebra"]
-git-tree-sha1 = "e3e64918b1604ba8b1734c4a27febdfe5d09e235"
+git-tree-sha1 = "7feeed2c9a7fa272189a5561bebf0c4ccaedb6ec"
 uuid = "7034ab61-46d4-4ed7-9d0f-46aef9175898"
-version = "1.3.1"
+version = "1.3.2"
 
     [deps.FastBroadcast.extensions]
     FastBroadcastPolyesterExt = "Polyester"
@@ -1106,9 +1280,9 @@ version = "1.1.3"
 
 [[deps.FunctionWrappersWrappers]]
 deps = ["FunctionWrappers", "PrecompileTools", "TruncatedStacktraces"]
-git-tree-sha1 = "ce6762f8f0e7542534f01523ae051e625cbf0468"
+git-tree-sha1 = "c1b0c3a166a2a393257aa888787ca817532e14ce"
 uuid = "77dc65aa-8811-40c2-897b-53d922fa7daf"
-version = "1.5.0"
+version = "1.8.0"
 
     [deps.FunctionWrappersWrappers.extensions]
     FunctionWrappersWrappersEnzymeExt = ["Enzyme", "EnzymeCore"]
@@ -1294,9 +1468,9 @@ version = "0.16.2"
 
 [[deps.IntervalArithmetic]]
 deps = ["CRlibm", "CoreMath", "MacroTools", "OpenBLASConsistentFPCSR_jll", "Printf", "Random", "RoundingEmulator"]
-git-tree-sha1 = "f1c42fcaca2d8034fe392f3e86c2e0809f75b2a1"
+git-tree-sha1 = "3569d7a1bd91f629f47ffe589c15b66530c720ca"
 uuid = "d1acc4aa-44c8-5952-acd4-ba5d80a2a253"
-version = "1.0.6"
+version = "1.0.7"
 
     [deps.IntervalArithmetic.extensions]
     IntervalArithmeticArblibExt = "Arblib"
@@ -1368,9 +1542,9 @@ version = "1.7.1"
 
 [[deps.JSON]]
 deps = ["Dates", "Logging", "Parsers", "PrecompileTools", "StructUtils", "UUIDs", "Unicode"]
-git-tree-sha1 = "67c6f1f085cb2671c93fe34244c9cccde30f7a26"
+git-tree-sha1 = "3e846e18560a65dcef26febd2ede0160c6831c1c"
 uuid = "682c06a0-de6a-54ab-a142-c8b1cf79cde6"
-version = "1.5.0"
+version = "1.5.1"
 
     [deps.JSON.extensions]
     JSONArrowExt = ["ArrowTypes"]
@@ -1421,10 +1595,10 @@ uuid = "88015f11-f218-50d7-93a8-a6af411a945d"
 version = "4.1.0+0"
 
 [[deps.LLVM]]
-deps = ["CEnum", "LLVMExtra_jll", "Libdl", "Preferences", "Printf", "Unicode"]
-git-tree-sha1 = "69e4739502b7ab5176117e97e1664ed181c35036"
+deps = ["CEnum", "LLVMExtra_jll", "Libdl", "PrecompileTools", "Preferences", "Printf", "Unicode"]
+git-tree-sha1 = "f1b04cbf4be550fabad4bbc38c3b18ba5bdf53a6"
 uuid = "929cbde3-209d-540e-8aea-75f648917ca0"
-version = "9.4.6"
+version = "9.7.0"
 
     [deps.LLVM.extensions]
     BFloat16sExt = "BFloat16s"
@@ -1434,9 +1608,9 @@ version = "9.4.6"
 
 [[deps.LLVMExtra_jll]]
 deps = ["Artifacts", "JLLWrappers", "LazyArtifacts", "Libdl", "TOML"]
-git-tree-sha1 = "8e76807afb59ebb833e9b131ebf1a8c006510f33"
+git-tree-sha1 = "f1d1adfff151fd02b4062d1af82df02052dc4a0c"
 uuid = "dad2f222-ce93-54a1-a47d-0025e8a3acab"
-version = "0.0.38+0"
+version = "0.0.42+0"
 
 [[deps.LLVMOpenMP_jll]]
 deps = ["Artifacts", "JLLWrappers", "Libdl"]
@@ -1568,9 +1742,9 @@ version = "0.5.16"
 
 [[deps.Makie]]
 deps = ["Animations", "Base64", "CRC32c", "ColorBrewer", "ColorSchemes", "ColorTypes", "Colors", "ComputePipeline", "Contour", "Dates", "DelaunayTriangulation", "Distributions", "DocStringExtensions", "Downloads", "FFMPEG_jll", "FileIO", "FilePaths", "FixedPointNumbers", "Format", "FreeType", "FreeTypeAbstraction", "GeometryBasics", "GridLayoutBase", "ImageBase", "ImageIO", "InteractiveUtils", "Interpolations", "IntervalSets", "InverseFunctions", "Isoband", "KernelDensity", "LaTeXStrings", "LinearAlgebra", "MacroTools", "Markdown", "MathTeXEngine", "Observables", "OffsetArrays", "PNGFiles", "Packing", "Pkg", "PlotUtils", "PolygonOps", "PrecompileTools", "Printf", "REPL", "Random", "RelocatableFolders", "Scratch", "ShaderAbstractions", "Showoff", "SignedDistanceFields", "SparseArrays", "Statistics", "StatsBase", "StatsFuns", "StructArrays", "TriplotBase", "UnicodeFun", "Unitful"]
-git-tree-sha1 = "68af66ec16af8b152309310251ecb4fbfe39869f"
+git-tree-sha1 = "0708c6a1f3cb18ba6482c4174058084c8d6deaf4"
 uuid = "ee78f7c6-11fb-53f2-987a-cfe4a2b5a57a"
-version = "0.24.9"
+version = "0.24.10"
 
     [deps.Makie.extensions]
     MakieDynamicQuantitiesExt = "DynamicQuantities"
@@ -1804,9 +1978,9 @@ version = "1.57.1+0"
 
 [[deps.Parsers]]
 deps = ["Dates", "PrecompileTools", "UUIDs"]
-git-tree-sha1 = "7d2f8f21da5db6a806faf7b9b292296da42b2810"
+git-tree-sha1 = "5d5e0a78e971354b1c7bff0655d11fdc1b0e12c8"
 uuid = "69de0a69-1ddd-5017-9359-2bf0b02dc9f0"
-version = "2.8.3"
+version = "2.8.4"
 
 [[deps.Pixman_jll]]
 deps = ["Artifacts", "CompilerSupportLibraries_jll", "JLLWrappers", "LLVMOpenMP_jll", "Libdl"]
@@ -1833,9 +2007,9 @@ version = "1.4.4"
 
 [[deps.PlutoUI]]
 deps = ["AbstractPlutoDingetjes", "Base64", "ColorTypes", "Dates", "Downloads", "FixedPointNumbers", "Hyperscript", "HypertextLiteral", "IOCapture", "InteractiveUtils", "Logging", "MIMEs", "Markdown", "Random", "Reexport", "URIs", "UUIDs"]
-git-tree-sha1 = "3ac7038a98ef6977d44adeadc73cc6f596c08109"
+git-tree-sha1 = "fbc875044d82c113a9dee6fc14e16cf01fd48872"
 uuid = "7f904dfe-b85e-4ff6-b463-dae2292396a8"
-version = "0.7.79"
+version = "0.7.80"
 
 [[deps.PolygonOps]]
 git-tree-sha1 = "77b3d3605fc1cd0b42d95eba87dfcd2bf67d5ff6"
@@ -2024,9 +2198,9 @@ version = "3.7.2"
 
 [[deps.SciMLBase]]
 deps = ["ADTypes", "Accessors", "Adapt", "ArrayInterface", "CommonSolve", "ConstructionBase", "Distributed", "DocStringExtensions", "EnumX", "FunctionWrappersWrappers", "IteratorInterfaceExtensions", "LinearAlgebra", "Logging", "Markdown", "Moshi", "PreallocationTools", "PrecompileTools", "Preferences", "Printf", "RecipesBase", "RecursiveArrayTools", "Reexport", "RuntimeGeneratedFunctions", "SciMLLogging", "SciMLOperators", "SciMLPublic", "SciMLStructures", "StaticArraysCore", "Statistics", "SymbolicIndexingInterface"]
-git-tree-sha1 = "4ab0641a10918b1a2d8f59c22ff641fc478332e3"
+git-tree-sha1 = "a017ed325ac5e11438c888864fe83b124bb171b7"
 uuid = "0bca4576-84f4-4d90-8ffe-ffa030f20462"
-version = "2.155.0"
+version = "2.155.1"
 
     [deps.SciMLBase.extensions]
     SciMLBaseChainRulesCoreExt = "ChainRulesCore"
@@ -2085,9 +2259,9 @@ weakdeps = ["Tracy"]
 
 [[deps.SciMLOperators]]
 deps = ["Accessors", "ArrayInterface", "DocStringExtensions", "LinearAlgebra"]
-git-tree-sha1 = "234869cf9fee9258a95464b7a7065cc7be84db00"
+git-tree-sha1 = "0e34162268883db01c04f988895a80d0659071bb"
 uuid = "c0aeaf25-5076-4817-a8d5-81caf7dfa961"
-version = "1.16.0"
+version = "1.17.0"
 weakdeps = ["SparseArrays", "StaticArraysCore"]
 
     [deps.SciMLOperators.extensions]
@@ -2192,9 +2366,9 @@ version = "0.1.2"
 
 [[deps.Static]]
 deps = ["CommonWorldInvalidations", "IfElse", "PrecompileTools", "SciMLPublic"]
-git-tree-sha1 = "49440414711eddc7227724ae6e570c7d5559a086"
+git-tree-sha1 = "bb072715f158b59ad8819ff80da5ffa90cce6ceb"
 uuid = "aedffcd0-7271-4cad-89d0-dc628f76c6d3"
-version = "1.3.1"
+version = "1.4.0"
 
 [[deps.StaticArrays]]
 deps = ["LinearAlgebra", "PrecompileTools", "Random", "StaticArraysCore"]
@@ -2268,9 +2442,9 @@ version = "0.3.1"
 
 [[deps.StructUtils]]
 deps = ["Dates", "UUIDs"]
-git-tree-sha1 = "aab80fbf866600f3299dd7f6656d80e7be177cfe"
+git-tree-sha1 = "86f5831495301b2a1387476cb30f86af7ab99194"
 uuid = "ec057cc2-7a8d-4b58-b3b3-92acb9f63b42"
-version = "2.7.2"
+version = "2.8.0"
 
     [deps.StructUtils.extensions]
     StructUtilsMeasurementsExt = ["Measurements"]
@@ -2494,9 +2668,9 @@ version = "0.9.12+0"
 
 [[deps.Xorg_libpciaccess_jll]]
 deps = ["Artifacts", "JLLWrappers", "Libdl", "Zlib_jll"]
-git-tree-sha1 = "4909eb8f1cbf6bd4b1c30dd18b2ead9019ef2fad"
+git-tree-sha1 = "58972370b81423fc546c56a60ed1a009450177c3"
 uuid = "a65dc6b1-eb27-53a1-bb3e-dea574b5389e"
-version = "0.18.1+0"
+version = "0.19.0+0"
 
 [[deps.Xorg_libxcb_jll]]
 deps = ["Artifacts", "JLLWrappers", "Libdl", "Xorg_libXau_jll", "Xorg_libXdmcp_jll"]
@@ -2619,6 +2793,13 @@ version = "4.1.0+0"
 # ╟─dfc641db-0aeb-4c69-900e-82118f30ed62
 # ╟─b661a9dd-5a93-4cb5-bdde-b9d5a5f1319c
 # ╟─c3ac0c56-5b0d-4b48-87cf-cb3be18acc81
+# ╟─242e41ba-4589-4303-849d-a4a2c266ed69
+# ╠═ce036e0a-4fc3-4dfc-a812-5c98effc87f5
+# ╠═d778ade0-c42d-468c-a673-ffed55c7887e
+# ╟─0ac7b532-f529-42ba-a251-b3ca92d1d5a6
+# ╟─609797f7-8ba9-45a1-b3df-7d0601237217
+# ╟─aa4672bd-c465-4986-8d23-8110b65d5e9d
+# ╟─6f63ae90-26a6-4e7c-9810-9b11e44ad192
 # ╟─96351793-9bcc-4376-9c95-b6b42f061ad8
 # ╟─bc148aac-1ef7-4611-b187-72f1255ff05f
 # ╟─92377a23-ac4f-4d5f-9d57-a0a03693307c
@@ -2631,6 +2812,7 @@ version = "4.1.0+0"
 # ╠═a970174f-44f4-4f8f-8cb8-cdda7b7ff7f4
 # ╠═d3f33333-de9d-49ac-b80f-85c160fae8d3
 # ╠═f47788ef-ea60-448b-9b43-1121b99a52c1
+# ╠═61ff147f-8779-46e6-a93e-216573b22fe2
 # ╟─ecc3d2a4-3a9a-4f1a-a070-3da403ecc005
 # ╟─00000000-0000-0000-0000-000000000001
 # ╟─00000000-0000-0000-0000-000000000002
